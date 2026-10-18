@@ -350,6 +350,9 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
 
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
+`--cache-ram-bytes off` disables retained RAM snapshots, preserving live-session
+reuse and optional disk persistence. Legacy adapters may still materialize a
+snapshot within their disk staging budget to persist it.
 A positive value replaces the automatic budget and may exceed it: it trades the
 free half of host RAM for retention, but always leaves 4 GiB to the OS and other
 processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
@@ -415,6 +418,19 @@ global least-recently-used, without conversation or rebuild-cost awareness.
 
 Flash-Next keeps the same options with these meanings:
 
+`--cache-ram-bytes off` disables RAM checkpoint retention and history captures.
+Disk captures use the existing streamed component path even for small prompts:
+completed rows can be read from live slots, while private state and partial tails
+are copied. The disk format, incremental chunk reuse and publication policy stay
+the same. A borrowed source overwritten before publication can still make an
+optional disk checkpoint incomplete; queued bytes do not mean durable success.
+
+The automatic byte ceiling still bounds transient metadata, private captures and
+backing pools. Committed free backing can remain allocated, and disk transfers
+still use the internal 1 MiB pinned buffer. Thus `off` means no retained RAM
+checkpoints, not zero host memory or a two-buffer-only memory footprint. Without
+disk caching, live session reuse remains available but no snapshots are retained.
+
 | Option | Meaning |
 | --- | --- |
 | `--cache-ram-bytes` | The automatic and explicit sizing above, as a cap. Pinned 64 KiB pages for up to about 89% of it are committed as captures need them, in equal steps of about 1 GiB, and stay committed; the rest is reserved for cache metadata, which grows with use. The pages hold checkpoint state, KV rows, partial tails and idle-session spill. There is no separate spill budget. |
@@ -427,7 +443,8 @@ private state, so below a budget of about 19 GB that state caps the checkpoint
 count under 128; only larger explicit budgets can reach the record limit. The startup line
 `schema=component-cache-v1 event=configured` reports `capacity_bytes`,
 `automatic_bytes`, `max_bytes`, `staging_capacity_bytes` and
-`disk_capacity_bytes`.
+`disk_capacity_bytes`. `retention_enabled=0` identifies RAM-off; `capacity_bytes`
+then describes the transient resource ceiling, not retained checkpoint capacity.
 
 Flash-Next prepares a bounded two-segment reserve before readiness and can
 prepare the next segment before a prefill with at least 512 tokens remaining

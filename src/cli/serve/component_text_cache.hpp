@@ -96,7 +96,7 @@ public:
   ComponentTextCache(std::shared_ptr<TextModelRunner>, std::size_t,
                      std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
-                     bool automatic_ram = false);
+                     bool automatic_ram = false, bool retention_enabled = true);
   ~ComponentTextCache();
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,

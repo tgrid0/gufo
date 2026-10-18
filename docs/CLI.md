@@ -80,6 +80,12 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 **Disk cache**
 
+For `serve llm`, `--cache-ram-bytes off` disables retained RAM snapshots;
+`0` keeps automatic sizing and positive values set the byte budget. Live session
+reuse remains available. With `--cache-disk`, Flash-Next also retains disk
+checkpoints, using bounded transient capture memory and its existing transfer
+buffer. `off` does not mean zero cache memory; see [cache budgets](KV-CACHE.md#flash-next-budgets).
+
 - `cacheDisk` — enable an on-disk cache of computed prompt state, reused
   across requests and restarts. In practice: repeated or shared prompts get
   much faster; costs disk space. Give each Flash-Next server its own

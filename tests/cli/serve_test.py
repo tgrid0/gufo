@@ -63,6 +63,12 @@ def main():
         check(["serve", *args], 1, "Error loading model 'audio'")
     check(["serve", "help", "unknown"], 2, "unknown serve command")
     help_text = check(["serve", "llm", "--help"], 0, "model native context")
+    for value in ("off", "0", "1048576"):
+        check(["serve", "llm", "--model", "/missing", "--cache-ram-bytes", value],
+              1, "Error loading model")
+    for value in ("OFF", "-1", "1x", "", "18446744073709551616"):
+        check(["serve", "llm", "--model", "/missing", "--cache-ram-bytes", value],
+              2, "--cache-ram-bytes")
     assert "-1 = until EOS or context full" in help_text
     assert "Path to GGUF model file (required)" in help_text
     assert "8589934592" in help_text

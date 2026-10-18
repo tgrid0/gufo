@@ -206,11 +206,12 @@ struct ComponentTextCache::Impl {
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
   cache::ResourceCharge metadata;
+  const bool retention_enabled;
 
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram,
        const std::optional<TextRunnerDiskCacheOptions>& options,
-       bool automatic_ram)
+       bool automatic_ram, bool retention_enabled)
       : runner(std::move(runner)),
         // Disk transfers lease one fixed pinned staging buffer. Its size does
         // not change restore or write speed (#562), and a larger one only
@@ -220,7 +221,8 @@ struct ComponentTextCache::Impl {
         resources(this->runner->CreateComponentCacheResources(ledger, ram)),
         identity(resources->adapter->CompatibilityIdentity()),
         index(ledger),
-        retention(ledger, index, &events) {
+        retention(ledger, index, &events),
+        retention_enabled(retention_enabled) {
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
     crypto::Sha256Hasher hash;
@@ -404,7 +406,8 @@ struct ComponentTextCache::Impl {
                      std::to_string(ledger.Limits().staging_bytes) +
                      " automatic_bytes=" + std::to_string(automatic_bytes) +
                      " max_bytes=" + std::to_string(max_bytes) +
-                     " disk_capacity_bytes=" + std::to_string(disk_capacity));
+                     " disk_capacity_bytes=" + std::to_string(disk_capacity) +
+                     " retention_enabled=" + (retention_enabled ? "1" : "0"));
   }
   ~Impl() {
     // Settle immutable-source readers before slots/resources/index unwind.
@@ -852,9 +855,10 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
 
 ComponentTextCache::ComponentTextCache(
     std::shared_ptr<TextModelRunner> runner, std::size_t count, std::size_t ram,
-    const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram)
+    const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram,
+    bool retention_enabled)
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram, disk,
-                                   automatic_ram)) {}
+                                   automatic_ram, retention_enabled)) {}
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
@@ -1255,6 +1259,9 @@ bool ComponentTextCache::Lease::HasSnapshotFor(
 bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,
     SnapshotPurpose purpose, std::span<const ContinuationToken> tokens) {
+  if (!impl_->cache->retention_enabled &&
+      (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory))
+    return false;
   if (!boundary || boundary > impl_->prompt.size() ||
       (bytes > impl_->cache->ledger.Limits().ram_bytes &&
        (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory)))
@@ -1297,6 +1304,8 @@ std::size_t ComponentTextCache::Lease::CaptureBytes(
 std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   auto& request = *impl_;
   auto& cache = *request.cache;
+  if (!cache.retention_enabled)
+    return request.CaptureDurable();
   auto positions =
       cache.resources->adapter->Positions(request.slot.Execution());
   const auto bytes = request.entry->history->NewPayloadBytes(positions);
@@ -1477,7 +1486,7 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
             .count();
     return 0;
   }
-  if (!component || !component->checkpoint)
+  if (!component || !component->checkpoint || !impl_->cache->retention_enabled)
     return 0;
   auto retain = impl_->Retain(tokens);
   retain.preserve_source = preserve;
@@ -1553,6 +1562,8 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
 
 std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
     std::size_t stable) const {
+  if (!impl_->cache->retention_enabled)
+    return {};
   const auto& adapter = *impl_->cache->resources->adapter;
   std::size_t private_bytes = 0;
   for (const auto& d : adapter.Components())

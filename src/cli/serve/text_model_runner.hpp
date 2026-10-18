@@ -54,6 +54,9 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// Disable retained snapshots, preserving live reuse and disk persistence.
+  /// Component caches still budget transient metadata and capture backing.
+  bool enabled{true};
 };
 
 struct TextRunnerDiskCacheOptions {

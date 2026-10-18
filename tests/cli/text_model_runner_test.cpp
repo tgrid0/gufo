@@ -1841,6 +1841,25 @@ void TestMeasuredStateIsReconciledWithClaim() {
          "measured resource check runs immediately after allocation");
 }
 
+void TestRetentionOffPreservesLegacyLiveReuse() {
+  auto stats = std::make_shared<FakeStats>();
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, {},
+                      {.enabled = false});
+  auto request = pool.Acquire({1, 2, 3});
+  (void)request.Prefill(3);
+  Expect(request.Commit().snapshot_bytes == 0,
+         "retention off does not publish a legacy snapshot");
+  Expect(stats->snapshot_captures == 0,
+         "retention off refuses snapshot allocation");
+  auto extension = pool.Acquire({1, 2, 3, 4});
+  Expect(extension.cached_prompt_tokens() == 3 &&
+             extension.cache_restore_bytes() == 0,
+         "retention off preserves legacy live reuse");
+  extension.Invalidate();
+  auto cold = pool.Acquire({1, 2, 3});
+  Expect(!cold.cache_hit(), "no retained checkpoint survives invalidation");
+  cold.Invalidate();
+}
 void TestSnapshotBudgetRefusalDoesNotFailCompletedRequest() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256,
@@ -2353,6 +2372,7 @@ int main() {
           eviction_log.str().find("reason=entry_capacity") != std::string::npos,
       "evicting a retained prefix for entry capacity is reported");
 
+  TestRetentionOffPreservesLegacyLiveReuse();
   TestSnapshotCacheCapacityIsReportedAtStartup();
   TestMeminfoAvailableExcludesFreeCma();
   TestSnapshotStartupReportsSelectedLimits();

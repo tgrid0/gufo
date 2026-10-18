@@ -256,6 +256,102 @@ TextRunnerToken Generate(TextRunnerPool::Request& request) {
   request.Advance();
   return token;
 }
+void RetentionOffKeepsLiveStateWithoutSnapshots() {
+  auto runner = std::make_shared<Runner>();
+  runner->partial = true;
+  TextRunnerPool pool(runner, 1, {}, {.enabled = false});
+  std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14};
+  auto request = pool.Acquire(prompt);
+  Prefill(request);
+  const auto token = Generate(request);
+  assert(request.Commit().snapshot_bytes == 0);
+  assert(runner->captures == 0);
+  prompt.push_back(token);
+  prompt.push_back(99);
+  auto continuation = pool.Acquire(prompt);
+  assert(continuation.cached_prompt_tokens() == 6);
+  assert(continuation.cache_restore_bytes() == 0);
+  Prefill(continuation);
+  continuation.Cancel();
+  assert(runner->captures == 0);
+  auto live = pool.Acquire(prompt);
+  assert(live.cache_hit());
+  live.Invalidate();
+  auto cold = pool.Acquire(prompt);
+  assert(!cold.cache_hit());
+  cold.Invalidate();
+}
+void RetentionOffPersistsSmallAndLargePrompts() {
+  for (const auto count : {9, 3073}) {
+    char pattern[] = "/tmp/gufo-component-off-test-XXXXXX";
+    const std::filesystem::path directory = mkdtemp(pattern);
+    const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                          .capacity_bytes = 1 << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    std::vector<TextRunnerToken> prompt(count);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    TextRunnerToken expected;
+    {
+      auto runner = std::make_shared<Runner>();
+      TextRunnerPool pool(runner, 1, disk, {.enabled = false});
+      auto request = pool.Acquire(prompt);
+      Prefill(request);
+      expected = request.SelectNext().token;
+      const auto metrics = request.Commit();
+      assert(metrics.snapshot_bytes == 0);
+      assert(metrics.disk_queued_bytes > 0);
+      // Only private state/tails are copied, not every completed row chunk.
+      assert(runner->captures < 16);
+    }  // Destruction drains accepted publication.
+    {
+      auto runner = std::make_shared<Runner>();
+      TextRunnerPool pool(runner, 1, disk, {.enabled = false});
+      auto restored = pool.Acquire(prompt);
+      assert(restored.cache_disk_hit());
+      assert(restored.cached_prompt_tokens() == prompt.size());
+      Prefill(restored);
+      assert(restored.SelectNext().token == expected);
+      (void)restored.Commit();
+    }
+    std::filesystem::remove_all(directory);
+  }
+}
+void RetentionOffRefusesHistoryAndHandlesCapturePressure() {
+  char pattern[] = "/tmp/gufo-component-off-pressure-XXXXXX";
+  const std::filesystem::path directory = mkdtemp(pattern);
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20};
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->private_blocks = 0;
+    ComponentTextCache cache(runner, 1, 1 << 22, disk, false, false);
+    const std::vector<TextRunnerToken> prompt{1, 2, 3, 4, 5};
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    const auto hash = runner->adapter->RecurrentHash(state.slot);
+    assert(lease->PlannedCaptures(0).empty());
+    assert(!lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                      false, SnapshotPurpose::kHistory,
+                                      prompt));
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    bool refused = false;
+    try {
+      (void)lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      refused = true;
+    }
+    assert(refused && lease->Metrics().disk_queued_bytes == 0);
+    assert(runner->adapter->RecurrentHash(state.slot) == hash);
+    (void)lease->Commit(prompt, {}, prompt);
+    auto reused = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(reused->cached_tokens() == prompt.size());
+    reused->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
 void InPassCapturePreservesBoundaryAndLiveTail() {
   std::vector<TextRunnerToken> prompt(40);
   std::iota(prompt.begin(), prompt.end(), 10);
@@ -1268,7 +1364,7 @@ void NearTailDiskBranchSurvivesRestart() {
   }
   std::filesystem::remove_all(directory);
 }
-void UnbackedDeepRowsSurviveDiskRestart() {
+void UnbackedDeepRowsSurviveDiskRestart(bool retention_enabled = true) {
   struct Gate {
     std::atomic<bool> entered{false};
     std::binary_semaphore reading{0}, release{0};
@@ -1296,12 +1392,14 @@ void UnbackedDeepRowsSurviveDiskRestart() {
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 8,
                                         .min_checkpoint_step_tokens = 1};
-  std::vector<TextRunnerToken> prompt(5001);
+  const std::size_t initial_tokens = 5001;
+  std::vector<TextRunnerToken> prompt(initial_tokens);
   std::iota(prompt.begin(), prompt.end(), 10);
   std::uint64_t hash;
   {
     auto runner = std::make_shared<HeldRunner>();
-    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    ComponentTextCache cache(runner, 2, 1 << 24, disk, false,
+                             retention_enabled);
     auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
     auto& state = dynamic_cast<State&>(lease->state());
     runner->adapter->Append(state.slot, prompt, prompt);
@@ -1309,18 +1407,28 @@ void UnbackedDeepRowsSurviveDiskRestart() {
     assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
                                      false, SnapshotPurpose::kContinuation,
                                      prompt));
-    // Over 40,000 logical row bytes exceed the 32,768-byte row pool.
+    // Both policies must stream deep rows beyond the fixed row backing.
     auto snapshot = lease->Capture();
     assert(snapshot);
     assert(lease->PublishSnapshot(prompt, std::move(snapshot), false) == 0);
-    assert(lease->Metrics().disk_queued_bytes > 40000);
+    assert(lease->Metrics().disk_queued_bytes > initial_tokens * 8);
     assert(runner->gate->reading.try_acquire_for(std::chrono::seconds(5)));
+    if (!retention_enabled) {
+      const std::vector<TextRunnerToken> other{91, 92, 93};
+      auto peer = cache.Acquire(other, {}, {}, true, 0, true);
+      auto& peer_state = dynamic_cast<State&>(peer->state());
+      runner->adapter->Append(peer_state.slot, other, other);
+      assert(runner->adapter->Positions(peer_state.slot).front().valid_rows ==
+             3);
+      peer->Invalidate();
+    }
     const auto pending = cache.PendingPublication(prompt, {});
     assert(pending && pending->checkpoint_id &&
            pending->pending_tokens == prompt.size() &&
            pending->available_tokens == 0 && pending->Gain() == prompt.size());
     assert(!cache.PendingPublication(prompt, {}, pending->checkpoint_id + 1));
-    assert(!cache.PendingPublication(std::span(prompt).first(4096), {}));
+    assert(!cache.PendingPublication(
+        std::span(prompt).first(initial_tokens - 1), {}));
     auto different = prompt;
     ++different.front();
     assert(!cache.PendingPublication(different, {}));
@@ -1349,7 +1457,8 @@ void UnbackedDeepRowsSurviveDiskRestart() {
     std::iota(appended.begin(), appended.end(), 8000);
     prompt.insert(prompt.end(), appended.begin(), appended.end());
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    ComponentTextCache cache(runner, 2, 1 << 24, disk, false,
+                             retention_enabled);
     auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
     assert(lease->restored_from_disk() && lease->cached_tokens() == seed_size);
     auto& state = dynamic_cast<State&>(lease->state());
@@ -1362,7 +1471,7 @@ void UnbackedDeepRowsSurviveDiskRestart() {
     auto snapshot = lease->Capture();
     assert(snapshot);
     assert(lease->PublishSnapshot(prompt, std::move(snapshot), false) == 0);
-    assert(lease->Metrics().disk_queued_bytes > 40000);
+    assert(lease->Metrics().disk_queued_bytes > initial_tokens * 8);
     (void)lease->Commit(prompt, {}, prompt);
   }
   {
@@ -1372,7 +1481,7 @@ void UnbackedDeepRowsSurviveDiskRestart() {
     const cache::DiskManifest* parent = nullptr;
     const cache::DiskManifest* child = nullptr;
     for (const auto& entry : store.Entries()) {
-      if (entry.Manifest().tokens.size() == 5001)
+      if (entry.Manifest().tokens.size() == initial_tokens)
         parent = &entry.Manifest();
       else if (entry.Manifest().tokens.size() == prompt.size())
         child = &entry.Manifest();
@@ -1393,7 +1502,8 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   }
   {
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    ComponentTextCache cache(runner, 2, 1 << 24, disk, false,
+                             retention_enabled);
     auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
     assert(lease->restored_from_disk() &&
            lease->cached_tokens() == prompt.size());
@@ -1404,6 +1514,9 @@ void UnbackedDeepRowsSurviveDiskRestart() {
 }
 }  // namespace
 int main() {
+  RetentionOffKeepsLiveStateWithoutSnapshots();
+  RetentionOffPersistsSmallAndLargePrompts();
+  RetentionOffRefusesHistoryAndHandlesCapturePressure();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   BackingPreparationAvoidsCachedDecodeAndShortTails();
@@ -1432,4 +1545,5 @@ int main() {
   GridDoesNotSuppressFirstDiskPrompt();
   NearTailDiskBranchSurvivesRestart();
   UnbackedDeepRowsSurviveDiskRestart();
+  UnbackedDeepRowsSurviveDiskRestart(false);
 }

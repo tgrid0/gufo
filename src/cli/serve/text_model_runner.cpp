@@ -481,6 +481,8 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                 TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
             validated->snapshot_max_bytes =
                 resources.retained_snapshot_ceiling_bytes.value_or(automatic);
+            if (!options.enabled)
+              return std::size_t{0};
             if (options.capacity_bytes == 0)
               return validated->snapshot_automatic_bytes;
             // An explicit limit is the operator's choice to trade headroom
@@ -618,7 +620,8 @@ struct TextRunnerPool::Impl {
       // state claim includes lazy image/rollback storage, not startup usage.
       component_cache = std::make_unique<ComponentTextCache>(
           validated.runner, state_count, std::min(requested, ceiling),
-          disk_cache_options, !ram_cache_options.capacity_bytes);
+          disk_cache_options, !ram_cache_options.capacity_bytes,
+          ram_cache_options.enabled);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =

@@ -37,6 +37,7 @@ def main():
         if option(command, flag) is not None:
             parser.error(f"the runner owns {flag}; omit it")
     mode = option(command, "--speculative", "off")
+    retention = option(command, "--cache-ram-bytes", "0") != "off"
     if mode not in ("off", "mtp"):
         parser.error("this check requires Flash-Next in AR or MTP mode")
     if args.startup_timeout <= 0:
@@ -141,6 +142,10 @@ def main():
         else:
             assert cached == 0, result
         assert usage["gufo"]["cache_disk_hit"] == disk, result
+        if not retention:
+            assert usage["gufo"]["cache_snapshot_bytes"] == 0, result
+            if stage_path.name == "ram":
+                assert usage["gufo"]["component_cache"]["captures"] == 0, result
         if mode == "mtp":
             assert usage.get("draft_tokens", 0) > 0, "MTP was not exercised"
         return result
@@ -150,18 +155,20 @@ def main():
         if "ram" in selected:
             with stage("ram"):
                 cold = chat("cold")
-                warm = chat("retry", warm=True)
+                # Retrying an earlier prompt requires a checkpoint; live state
+                # has advanced past it. Retention off intentionally recomputes.
+                warm = chat("retry", warm=retention)
                 assert continuation.digest(cold) == continuation.digest(warm)
         if "disk" in selected:
             with stage("disk", disk=True):
                 cold = chat("cold")
-                warm = chat("retry", warm=True)
-                assert continuation.digest(cold) == continuation.digest(warm)
                 wait_until(lambda: any(
                     tokens >= cold["usage"]["prompt_tokens"] - 8
                     for tokens in published_tokens(
                         (stage_path / "server.log").read_text())),
                     "the prompt's durable checkpoint before restart")
+                warm = chat("retry", warm=True, disk=not retention)
+                assert continuation.digest(cold) == continuation.digest(warm)
             with stage("restart", disk=True):
                 restored = chat("restored", warm=True, disk=True)
                 assert continuation.digest(cold) == continuation.digest(restored)

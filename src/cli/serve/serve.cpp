@@ -606,7 +606,7 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
+    std::string cache_ram_value = "0";
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -710,11 +710,13 @@ void PrintServeHelp(std::string_view program_name,
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+        "", "--cache-ram-bytes", "off|N",
+        "Retained RAM-cache byte budget (off disables retention; default: 0 = "
+        "auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). "
-        "Flash-Next pins it about 1 GiB at a time as captures need it",
-        "Cache", &cache_ram_bytes);
+        "Flash-Next still budgets transient cache resources when retention is "
+        "off",
+        "Cache", &cache_ram_value);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory "
                      "(Flash-Next: owned by one process)",
@@ -1153,7 +1155,7 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
+    std::string cache_ram_value = "0";
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1253,11 +1255,13 @@ int RunServe(std::span<const char* const> args) {
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     llm_parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+        "", "--cache-ram-bytes", "off|N",
+        "Retained RAM-cache byte budget (off disables retention; default: 0 = "
+        "auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). "
-        "Flash-Next pins it about 1 GiB at a time as captures need it",
-        "Cache", &cache_ram_bytes);
+        "Flash-Next still budgets transient cache resources when retention is "
+        "off",
+        "Cache", &cache_ram_value);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory "
                          "(Flash-Next: owned by one process)",
@@ -1289,6 +1293,18 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    std::size_t cache_ram_bytes = 0;
+    const bool cache_ram_enabled = cache_ram_value != "off";
+    if (cache_ram_enabled) {
+      const auto* end = cache_ram_value.data() + cache_ram_value.size();
+      const auto parsed =
+          std::from_chars(cache_ram_value.data(), end, cache_ram_bytes);
+      if (parsed.ec != std::errc{} || parsed.ptr != end) {
+        std::cerr << "Error: --cache-ram-bytes must be off or an unsigned byte "
+                     "count\n";
+        return 2;
+      }
     }
     if (!llm_parser.WasSupplied("--max-pending-per-client")) {
       max_pending_requests_per_client = max_pending_requests;
@@ -1432,7 +1448,8 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path,
-        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes});
+        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes,
+                                          .enabled = cache_ram_enabled});
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
