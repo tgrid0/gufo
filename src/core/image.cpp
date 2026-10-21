@@ -513,8 +513,11 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
       std::min(5000L, static_cast<long>(remaining_ms)));
   set(CURLOPT_NOSIGNAL, 1L);
   set(CURLOPT_FAILONERROR, 1L);
+  // Never fetch more than the per-image limit can decode, even though the
+  // request budget still allows more images.
   set(CURLOPT_MAXFILESIZE_LARGE,
-      static_cast<curl_off_t>(budget.remaining_bytes));
+      static_cast<curl_off_t>(
+          std::min(budget.remaining_bytes, kMaxEncodedImageBytes)));
   set(
       CURLOPT_OPENSOCKETFUNCTION,
       +[](void*, curlsocktype purpose,

@@ -12,7 +12,12 @@
 
 namespace gufo::core {
 
+/// Per-image encoded size limit for decoding and image files.
 inline constexpr std::size_t kMaxEncodedImageBytes = 20 * 1024 * 1024;
+/// Total image bytes across all images of one request. A conversation
+/// replays every prior tool-result image each turn, so this must stay
+/// comfortably above the per-image limit.
+inline constexpr std::size_t kMaxRequestImageBytes = 64 * 1024 * 1024;
 inline constexpr std::size_t kMaxImagePixels = 32 * 1024 * 1024;
 
 struct Image {
@@ -31,7 +36,7 @@ struct ImageReadBudget {
   /// False when the loaded model takes no image input; reading is refused
   /// before any data URL is decoded or any URL is fetched.
   bool accepts_images{true};
-  std::size_t remaining_bytes{kMaxEncodedImageBytes};
+  std::size_t remaining_bytes{kMaxRequestImageBytes};
   std::chrono::steady_clock::time_point deadline{
       std::chrono::steady_clock::now() + std::chrono::seconds(15)};
 };
